@@ -17,3 +17,18 @@ Please cite RiboVision 2.0 publication https://doi.org/10.1016/j.jmb.2024.168556
 
 ## Licensing 
 Webserver is licensed under the MIT license.
+
+## Command-line tooling
+
+The `scripts/generate_rna_annotations.py` helper aligns an input PDB/mmCIF structure
+containing ribosomal RNA against the curated secondary-structure references that ship
+with RiboVision. For each large (23S) and small (16S) subunit chain it can identify,
+the script exports two CSV reports with helix-to-residue mappings alongside a coloured
+SVG rendering of the reference secondary structure.
+
+```
+python scripts/generate_rna_annotations.py path/to/structure.pdb --output output_dir
+```
+
+The tool requires [Biopython](https://biopython.org/) for sequence alignment and
+structure parsing.
