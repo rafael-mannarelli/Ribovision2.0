@@ -196,6 +196,54 @@ def iter_structure_chains(structure_path: Path) -> Iterable[ChainSequence]:
         break  # only first model
 
 
+def extract_structure_species(structure_path: Path) -> List[str]:
+    """Best-effort extraction of organism names from PDB/mmCIF metadata."""
+
+    species: List[str] = []
+    suffix = structure_path.suffix.lower()
+
+    if suffix in {".cif", ".mmcif"}:
+        try:
+            from Bio.PDB.MMCIF2Dict import MMCIF2Dict
+
+            data = MMCIF2Dict(str(structure_path))
+            for key in (
+                "_entity_src_gen.pdbx_organism_scientific",
+                "_entity_src_nat.pdbx_organism_scientific",
+                "_entity.pdbx_description",
+            ):
+                values = data.get(key)
+                if not values:
+                    continue
+                if isinstance(values, str):
+                    values = [values]
+                for value in values:
+                    value = (value or "").strip()
+                    if value and value != "?":
+                        species.append(value)
+        except Exception:
+            pass
+    else:
+        try:
+            with structure_path.open() as handle:
+                for line in handle:
+                    if "ORGANISM_SCIENTIFIC" not in line:
+                        continue
+                    # PDB headers typically use "ORGANISM_SCIENTIFIC: <name>".
+                    fragment = line.split("ORGANISM_SCIENTIFIC", 1)[1]
+                    if ":" in fragment:
+                        fragment = fragment.split(":", 1)[1]
+                    fragment = fragment.split(";")[0]
+                    fragment = fragment.split(",")[0]
+                    value = fragment.strip()
+                    if value:
+                        species.append(value)
+        except OSError:
+            pass
+
+    return species
+
+
 def residue_to_base(resname: str) -> Optional[str]:
     if resname in NUCLEOTIDE_MAP:
         return NUCLEOTIDE_MAP[resname]
@@ -292,59 +340,71 @@ def classify_domain(species: str, ss_table: str) -> str:
 
 
 def pick_best_alignments(
-    references: Dict[Tuple[str, str], ReferenceSequence], chains: Iterable[ChainSequence]
+    references: Dict[Tuple[str, str], ReferenceSequence],
+    chains: Iterable[ChainSequence],
+    structure_species: Sequence[str],
 ) -> Dict[str, AlignmentResult]:
-    """Pick best reference alignments, keeping 23S/16S domain-consistent.
+    """Pick best reference alignments with species/domain coherence.
 
-    Archaea can align better against archaeal references even when a bacterial
-    16S fragment achieves a slightly higher raw identity. To avoid mixing
-    domains, we score alignments within each domain first (bacteria, archaea,
-    eukaryote, unknown) and select the best-scoring domain pair. This keeps 23S
-    and 16S outputs paired to biologically coherent references without giving
-    up the existing identity/coverage prioritisation.
+    We prefer references from the same organism as the input structure when
+    available. If no explicit organism is detected, the best matching species is
+    chosen based on the combined alignment score (identity * coverage) across
+    16S/23S to keep the subunits coherent. This still honours archaeal/bacterial
+    differences while favouring the closest available reference.
     """
 
-    by_mol: Dict[str, List[AlignmentResult]] = defaultdict(list)
+    by_species: Dict[str, Dict[str, AlignmentResult]] = defaultdict(dict)
 
     for chain in chains:
         for (ss_table, mol), reference in references.items():
             if mol not in {"23S", "16S"}:
                 continue
             result = align_sequences(reference, chain)
-            by_mol[mol].append(result)
+            current_best = by_species[reference.species].get(mol)
+            if current_best is None:
+                by_species[reference.species][mol] = result
+                continue
+            current_score = current_best.identity * current_best.coverage
+            new_score = result.identity * result.coverage
+            if (new_score, result.identity) > (current_score, current_best.identity):
+                by_species[reference.species][mol] = result
 
-    def pick_best(results: List[AlignmentResult]) -> Optional[AlignmentResult]:
-        if not results:
-            return None
-        return max(results, key=lambda r: (r.identity * r.coverage, r.identity))
+    def pick_species_best(species_candidates: Dict[str, Dict[str, AlignmentResult]]) -> Dict[str, AlignmentResult]:
+        if not species_candidates:
+            return {}
 
-    # Evaluate alignments within each reference domain to keep 23S/16S matched.
-    domains = {r.reference.domain for results in by_mol.values() for r in results}
-    domain_candidates: Dict[str, Dict[str, AlignmentResult]] = {}
-    domain_scores: Dict[str, float] = {}
+        def species_score(item: Tuple[str, Dict[str, AlignmentResult]]) -> Tuple[int, float, float]:
+            _, mol_map = item
+            has_both = int("16S" in mol_map and "23S" in mol_map)
+            combined = sum(r.identity * r.coverage for r in mol_map.values())
+            best_identity = max((r.identity for r in mol_map.values()), default=0.0)
+            return has_both, combined, best_identity
 
-    for domain in domains or {"unknown"}:
-        domain_candidates[domain] = {}
-        total_score = 0.0
-        for mol in ("16S", "23S"):
-            domain_results = [r for r in by_mol.get(mol, []) if r.reference.domain == domain]
-            best_result = pick_best(domain_results)
-            if best_result:
-                domain_candidates[domain][mol] = best_result
-                total_score += best_result.identity * best_result.coverage
-        domain_scores[domain] = total_score
+        return species_candidates[max(species_candidates.items(), key=species_score)[0]]
 
-    # Fall back to cross-domain bests if no domain yields both subunits.
-    if not any("16S" in candidates or "23S" in candidates for candidates in domain_candidates.values()):
-        best: Dict[str, AlignmentResult] = {}
-        if by_mol.get("16S"):
-            best["16S"] = pick_best(by_mol["16S"])
-        if by_mol.get("23S"):
-            best["23S"] = pick_best(by_mol["23S"])
-        return best
+    structure_species_lc = {s.lower() for s in structure_species}
+    matching_species = {
+        species: results
+        for species, results in by_species.items()
+        if species.lower() in structure_species_lc
+    }
 
-    selected_domain = max(domain_scores, key=domain_scores.get)
-    return domain_candidates[selected_domain]
+    if matching_species:
+        return pick_species_best(matching_species)
+
+    # Fall back to the closest-scoring species overall.
+    selected = pick_species_best(by_species)
+    if selected:
+        return selected
+
+    # Final fall back: return the best alignment per molecule regardless of species.
+    best: Dict[str, AlignmentResult] = {}
+    for mol in ("16S", "23S"):
+        mol_results = [results[mol] for results in by_species.values() if mol in results]
+        if mol_results:
+            best_result = max(mol_results, key=lambda r: (r.identity * r.coverage, r.identity))
+            best[mol] = best_result
+    return best
 
 
 def group_consecutive(indices: Sequence[int]) -> List[Tuple[int, int]]:
@@ -512,13 +572,17 @@ def main() -> None:
         raise SystemExit(f"Input structure not found: {args.pdb}")
 
     references = build_reference_sequences()
+    structure_species = extract_structure_species(args.pdb)
     chains = list(iter_structure_chains(args.pdb))
     if not chains:
         raise SystemExit("No RNA chains with recognised nucleotides were found in the structure.")
 
-    best = pick_best_alignments(references, chains)
+    best = pick_best_alignments(references, chains, structure_species)
     output_dir = args.output
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if structure_species:
+        print("Detected structure species:", "; ".join(structure_species))
 
     for mol in ("23S", "16S"):
         result = best.get(mol)
