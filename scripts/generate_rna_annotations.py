@@ -226,6 +226,10 @@ class AlignmentResult:
 
 
 def align_sequences(reference: ReferenceSequence, chain: ChainSequence) -> AlignmentResult:
+    # Use a semi-global alignment that does not penalise terminal gaps on the
+    # structure chain. Experimental or truncated structures frequently miss
+    # nucleotides at the ends, and penalising those gaps can force suboptimal
+    # alignments that shift the entire mapping.
     alignment = pairwise2.align.globalms(
         reference.sequence,
         chain.sequence,
@@ -234,6 +238,7 @@ def align_sequences(reference: ReferenceSequence, chain: ChainSequence) -> Align
         -5.0,
         -1.0,
         one_alignment_only=True,
+        penalize_end_gaps=(True, False),
     )[0]
     ref_aln, chain_aln, score, _, _ = alignment
 
@@ -283,7 +288,10 @@ def pick_best_alignments(
     def pick_best(results: List[AlignmentResult]) -> Optional[AlignmentResult]:
         if not results:
             return None
-        return max(results, key=lambda r: r.identity)
+        # Prioritise alignments that cover more of the reference while still
+        # maximising identity. This avoids selecting a short, high-identity
+        # fragment over a more comprehensive 23S match.
+        return max(results, key=lambda r: (r.identity * r.coverage, r.identity))
 
     best_16s = pick_best(by_mol.get("16S", []))
     if best_16s:
