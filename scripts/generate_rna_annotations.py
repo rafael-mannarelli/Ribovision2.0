@@ -354,20 +354,46 @@ def pick_best_alignments(
     """
 
     by_species: Dict[str, Dict[str, AlignmentResult]] = defaultdict(dict)
+    species_domain: Dict[str, str] = {}
+    best_by_domain: Dict[str, Dict[str, AlignmentResult]] = defaultdict(dict)
+    best_overall: Dict[str, AlignmentResult] = {}
 
     for chain in chains:
         for (ss_table, mol), reference in references.items():
             if mol not in {"23S", "16S"}:
                 continue
             result = align_sequences(reference, chain)
-            current_best = by_species[reference.species].get(mol)
-            if current_best is None:
-                by_species[reference.species][mol] = result
-                continue
-            current_score = current_best.identity * current_best.coverage
+            species_domain[reference.species] = reference.domain
+
+            domain_best = best_by_domain[mol].get(reference.domain)
             new_score = result.identity * result.coverage
-            if (new_score, result.identity) > (current_score, current_best.identity):
+
+            current_best = by_species[reference.species].get(mol)
+            if current_best is None or (
+                new_score, result.identity
+            ) > (
+                current_best.identity * current_best.coverage,
+                current_best.identity,
+            ):
                 by_species[reference.species][mol] = result
+
+            domain_best = best_by_domain[mol].get(reference.domain)
+            if domain_best is None or (
+                new_score, result.identity
+            ) > (
+                domain_best.identity * domain_best.coverage,
+                domain_best.identity,
+            ):
+                best_by_domain[mol][reference.domain] = result
+
+            overall_best = best_overall.get(mol)
+            if overall_best is None or (
+                new_score, result.identity
+            ) > (
+                overall_best.identity * overall_best.coverage,
+                overall_best.identity,
+            ):
+                best_overall[mol] = result
 
     def pick_species_best(species_candidates: Dict[str, Dict[str, AlignmentResult]]) -> Dict[str, AlignmentResult]:
         if not species_candidates:
@@ -389,22 +415,45 @@ def pick_best_alignments(
         if species.lower() in structure_species_lc
     }
 
-    if matching_species:
-        return pick_species_best(matching_species)
+    selected: Dict[str, AlignmentResult]
 
-    # Fall back to the closest-scoring species overall.
-    selected = pick_species_best(by_species)
+    if matching_species:
+        selected = pick_species_best(matching_species)
+    else:
+        # Fall back to the closest-scoring species overall.
+        selected = pick_species_best(by_species)
+
+    if not selected:
+        selected = {}
+
+    # Backfill any missing molecules using the best-scoring alignment for the
+    # selected species' domain if available, otherwise the best overall
+    # alignment. This prevents cases where only one chain is mapped and the
+    # remaining subunit never produces annotation outputs.
+    selected_domain = None
     if selected:
-        return selected
+        any_result = next(iter(selected.values()))
+        selected_domain = any_result.reference.domain
+
+    for mol in ("16S", "23S"):
+        if mol in selected:
+            continue
+        domain_result = None
+        if selected_domain:
+            domain_result = best_by_domain.get(mol, {}).get(selected_domain)
+        selected[mol] = domain_result or best_overall.get(mol)
 
     # Final fall back: return the best alignment per molecule regardless of species.
-    best: Dict[str, AlignmentResult] = {}
-    for mol in ("16S", "23S"):
-        mol_results = [results[mol] for results in by_species.values() if mol in results]
-        if mol_results:
-            best_result = max(mol_results, key=lambda r: (r.identity * r.coverage, r.identity))
-            best[mol] = best_result
-    return best
+    if not any(selected.values()):
+        best: Dict[str, AlignmentResult] = {}
+        for mol in ("16S", "23S"):
+            mol_results = [results[mol] for results in by_species.values() if mol in results]
+            if mol_results:
+                best_result = max(mol_results, key=lambda r: (r.identity * r.coverage, r.identity))
+                best[mol] = best_result
+        return best
+
+    return {k: v for k, v in selected.items() if v is not None}
 
 
 def group_consecutive(indices: Sequence[int]) -> List[Tuple[int, int]]:
