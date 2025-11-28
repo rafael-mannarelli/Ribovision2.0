@@ -226,6 +226,10 @@ class AlignmentResult:
 
 
 def align_sequences(reference: ReferenceSequence, chain: ChainSequence) -> AlignmentResult:
+    # Use a semi-global alignment that does not penalise terminal gaps on the
+    # structure chain. Experimental or truncated structures frequently miss
+    # nucleotides at the ends, and penalising those gaps can force suboptimal
+    # alignments that shift the entire mapping.
     alignment = pairwise2.align.globalms(
         reference.sequence,
         chain.sequence,
@@ -234,6 +238,7 @@ def align_sequences(reference: ReferenceSequence, chain: ChainSequence) -> Align
         -5.0,
         -1.0,
         one_alignment_only=True,
+        penalize_end_gaps=(True, False),
     )[0]
     ref_aln, chain_aln, score, _, _ = alignment
 
@@ -257,17 +262,56 @@ def align_sequences(reference: ReferenceSequence, chain: ChainSequence) -> Align
     return AlignmentResult(reference=reference, chain=chain, ref_to_chain=ref_to_chain, identity=identity, coverage=coverage)
 
 
-def pick_best_alignments(references: Dict[Tuple[str, str], ReferenceSequence], chains: Iterable[ChainSequence]) -> Dict[str, AlignmentResult]:
-    best: Dict[str, AlignmentResult] = {}
+def pick_best_alignments(
+    references: Dict[Tuple[str, str], ReferenceSequence], chains: Iterable[ChainSequence]
+) -> Dict[str, AlignmentResult]:
+    """Pick best reference alignments, preferring matching species for 23S.
+
+    The 23S and 16S references should come from the same organism as the input
+    structure. We first find the best 16S alignment and then, if possible,
+    select the 23S reference from the same species. This avoids pairing the 23S
+    chain with an unrelated species when another species aligns slightly
+    better.
+    """
+
+    by_mol: Dict[str, List[AlignmentResult]] = defaultdict(list)
+
     for chain in chains:
         for (ss_table, mol), reference in references.items():
             if mol not in {"23S", "16S"}:
                 continue
             result = align_sequences(reference, chain)
-            key = mol
-            existing = best.get(key)
-            if existing is None or result.identity > existing.identity:
-                best[key] = result
+            by_mol[mol].append(result)
+
+    best: Dict[str, AlignmentResult] = {}
+
+    def pick_best(results: List[AlignmentResult]) -> Optional[AlignmentResult]:
+        if not results:
+            return None
+        # Prioritise alignments that cover more of the reference while still
+        # maximising identity. This avoids selecting a short, high-identity
+        # fragment over a more comprehensive 23S match.
+        return max(results, key=lambda r: (r.identity * r.coverage, r.identity))
+
+    best_16s = pick_best(by_mol.get("16S", []))
+    if best_16s:
+        best["16S"] = best_16s
+
+    preferred_species = best_16s.reference.species if best_16s else None
+
+    def pick_best_23s() -> Optional[AlignmentResult]:
+        results = by_mol.get("23S", [])
+        if preferred_species:
+            matching_species = [r for r in results if r.reference.species == preferred_species]
+            selected = pick_best(matching_species)
+            if selected:
+                return selected
+        return pick_best(results)
+
+    best_23s = pick_best_23s()
+    if best_23s:
+        best["23S"] = best_23s
+
     return best
 
 
