@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
-    from Bio import pairwise2
+    from Bio.Align import PairwiseAligner
     from Bio.PDB import MMCIFParser, PDBParser
 except ImportError as exc:  # pragma: no cover - handled at runtime
     raise SystemExit(
@@ -230,33 +230,31 @@ def align_sequences(reference: ReferenceSequence, chain: ChainSequence) -> Align
     # structure chain. Experimental or truncated structures frequently miss
     # nucleotides at the ends, and penalising those gaps can force suboptimal
     # alignments that shift the entire mapping.
-    alignment = pairwise2.align.globalms(
-        reference.sequence,
-        chain.sequence,
-        2.0,
-        -1.0,
-        -5.0,
-        -1.0,
-        one_alignment_only=True,
-        penalize_end_gaps=(True, False),
-    )[0]
-    ref_aln, chain_aln, score, _, _ = alignment
+    aligner = PairwiseAligner()
+    aligner.mode = "global"
+    aligner.match_score = 2.0
+    aligner.mismatch_score = -1.0
+    aligner.open_gap_score = -5.0
+    aligner.extend_gap_score = -1.0
+    aligner.target_end_gap_score = aligner.open_gap_score
+    aligner.query_end_gap_score = 0.0
 
-    ref_pos = 0
-    chain_pos = 0
+    alignment = next(iter(aligner.align(reference.sequence, chain.sequence)))
+
     ref_to_chain: Dict[int, int] = {}
     matches = 0
     aligned_pairs = 0
-    for r_char, c_char in zip(ref_aln, chain_aln):
-        if r_char != "-":
-            ref_pos += 1
-        if c_char != "-":
-            chain_pos += 1
-        if r_char != "-" and c_char != "-":
-            ref_to_chain[ref_pos - 1] = chain_pos - 1
+
+    ref_segments, chain_segments = alignment.aligned
+    for (ref_start, ref_end), (chain_start, chain_end) in zip(ref_segments, chain_segments):
+        for offset in range(ref_end - ref_start):
+            ref_idx = ref_start + offset
+            chain_idx = chain_start + offset
+            ref_to_chain[ref_idx] = chain_idx
             aligned_pairs += 1
-            if r_char == c_char:
+            if reference.sequence[ref_idx] == chain.sequence[chain_idx]:
                 matches += 1
+
     identity = matches / aligned_pairs if aligned_pairs else 0.0
     coverage = aligned_pairs / len(reference.residues) if reference.residues else 0.0
     return AlignmentResult(reference=reference, chain=chain, ref_to_chain=ref_to_chain, identity=identity, coverage=coverage)
