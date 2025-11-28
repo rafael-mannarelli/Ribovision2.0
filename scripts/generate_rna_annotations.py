@@ -72,6 +72,7 @@ class ReferenceSequence:
     ss_table: str
     mol_name: str
     species: str
+    domain: str
     residues: List[ResidueRecord]
 
     @property
@@ -161,6 +162,7 @@ def build_reference_sequences() -> Dict[Tuple[str, str], ReferenceSequence]:
             ss_table=ss_table,
             mol_name=mol,
             species=species,
+            domain=classify_domain(species, ss_table),
             residues=records,
         )
     return references
@@ -260,16 +262,46 @@ def align_sequences(reference: ReferenceSequence, chain: ChainSequence) -> Align
     return AlignmentResult(reference=reference, chain=chain, ref_to_chain=ref_to_chain, identity=identity, coverage=coverage)
 
 
+def classify_domain(species: str, ss_table: str) -> str:
+    """Classify the reference domain (bacteria/archaea/eukaryote/unknown).
+
+    The available references span bacteria (e.g. *E. coli*, *T. thermophilus*),
+    archaea (e.g. *H. marismortui*, *P. furiosus*), and eukaryotes. A simple
+    keyword-based classifier keeps the alignment pairing consistent across 16S
+    and 23S chains, especially for archaeal structures whose optimal matches
+    can differ from bacterial ones in both length and sequence composition.
+    """
+
+    species_lc = species.lower()
+    ss_table_lc = ss_table.lower()
+
+    archaeal_keys = ("haloarcula", "marismortui", "pyrococcus", "furiosus")
+    bacterial_keys = ("escherichia", "coli", "thermus", "thermophilus")
+    euk_keys = ("drosophila", "homo", "saccharomyces")
+
+    def has_any(keys: Tuple[str, ...]) -> bool:
+        return any(key in species_lc or key in ss_table_lc for key in keys)
+
+    if has_any(archaeal_keys):
+        return "archaea"
+    if has_any(bacterial_keys):
+        return "bacteria"
+    if has_any(euk_keys):
+        return "eukaryote"
+    return "unknown"
+
+
 def pick_best_alignments(
     references: Dict[Tuple[str, str], ReferenceSequence], chains: Iterable[ChainSequence]
 ) -> Dict[str, AlignmentResult]:
-    """Pick best reference alignments, preferring matching species for 23S.
+    """Pick best reference alignments, keeping 23S/16S domain-consistent.
 
-    The 23S and 16S references should come from the same organism as the input
-    structure. We first find the best 16S alignment and then, if possible,
-    select the 23S reference from the same species. This avoids pairing the 23S
-    chain with an unrelated species when another species aligns slightly
-    better.
+    Archaea can align better against archaeal references even when a bacterial
+    16S fragment achieves a slightly higher raw identity. To avoid mixing
+    domains, we score alignments within each domain first (bacteria, archaea,
+    eukaryote, unknown) and select the best-scoring domain pair. This keeps 23S
+    and 16S outputs paired to biologically coherent references without giving
+    up the existing identity/coverage prioritisation.
     """
 
     by_mol: Dict[str, List[AlignmentResult]] = defaultdict(list)
@@ -281,36 +313,38 @@ def pick_best_alignments(
             result = align_sequences(reference, chain)
             by_mol[mol].append(result)
 
-    best: Dict[str, AlignmentResult] = {}
-
     def pick_best(results: List[AlignmentResult]) -> Optional[AlignmentResult]:
         if not results:
             return None
-        # Prioritise alignments that cover more of the reference while still
-        # maximising identity. This avoids selecting a short, high-identity
-        # fragment over a more comprehensive 23S match.
         return max(results, key=lambda r: (r.identity * r.coverage, r.identity))
 
-    best_16s = pick_best(by_mol.get("16S", []))
-    if best_16s:
-        best["16S"] = best_16s
+    # Evaluate alignments within each reference domain to keep 23S/16S matched.
+    domains = {r.reference.domain for results in by_mol.values() for r in results}
+    domain_candidates: Dict[str, Dict[str, AlignmentResult]] = {}
+    domain_scores: Dict[str, float] = {}
 
-    preferred_species = best_16s.reference.species if best_16s else None
+    for domain in domains or {"unknown"}:
+        domain_candidates[domain] = {}
+        total_score = 0.0
+        for mol in ("16S", "23S"):
+            domain_results = [r for r in by_mol.get(mol, []) if r.reference.domain == domain]
+            best_result = pick_best(domain_results)
+            if best_result:
+                domain_candidates[domain][mol] = best_result
+                total_score += best_result.identity * best_result.coverage
+        domain_scores[domain] = total_score
 
-    def pick_best_23s() -> Optional[AlignmentResult]:
-        results = by_mol.get("23S", [])
-        if preferred_species:
-            matching_species = [r for r in results if r.reference.species == preferred_species]
-            selected = pick_best(matching_species)
-            if selected:
-                return selected
-        return pick_best(results)
+    # Fall back to cross-domain bests if no domain yields both subunits.
+    if not any("16S" in candidates or "23S" in candidates for candidates in domain_candidates.values()):
+        best: Dict[str, AlignmentResult] = {}
+        if by_mol.get("16S"):
+            best["16S"] = pick_best(by_mol["16S"])
+        if by_mol.get("23S"):
+            best["23S"] = pick_best(by_mol["23S"])
+        return best
 
-    best_23s = pick_best_23s()
-    if best_23s:
-        best["23S"] = best_23s
-
-    return best
+    selected_domain = max(domain_scores, key=domain_scores.get)
+    return domain_candidates[selected_domain]
 
 
 def group_consecutive(indices: Sequence[int]) -> List[Tuple[int, int]]:
